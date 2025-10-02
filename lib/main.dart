@@ -1,8 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import 'package:timeline_tile/timeline_tile.dart';
+import 'package:usage_stats/usage_stats.dart'; // usage_statsプラグインをインポート
 
-// 1. データ構造を「単一イベント」として定義
+// UsageEventクラスの定義（変更なし）
 class UsageEvent {
   final String title;
   final IconData icon;
@@ -18,74 +19,6 @@ class UsageEvent {
     required this.timestamp,
   });
 }
-
-// 2. 画像のタイムラインに合わせたダミーデータを作成
-final List<UsageEvent> mockEvents = [
-  UsageEvent(
-    title: 'Pantalla apagada (bloqueada)', // 画面オフ（ロック）
-    icon: Icons.phonelink_lock,
-    iconColor: Colors.grey,
-    duration: const Duration(minutes: 8, seconds: 25),
-    timestamp: DateTime.now().subtract(const Duration(minutes: 10)),
-  ),
-  UsageEvent(
-    title: 'Pantalla apagada (no bloqueada)', // 画面オフ（非ロック）
-    icon: Icons.phone_android,
-    iconColor: Colors.grey,
-    duration: const Duration(seconds: 5),
-    timestamp: DateTime.now().subtract(const Duration(minutes: 10)),
-  ),
-  UsageEvent(
-    title: 'Instagram',
-    icon: Icons.camera_alt, // 仮のアイコン
-    iconColor: Colors.pink,
-    duration: const Duration(seconds: 2),
-    timestamp: DateTime.now().subtract(const Duration(minutes: 10)),
-  ),
-  UsageEvent(
-    title: 'Pantalla encendida (no bloqueada)', // 画面オン（非ロック）
-    icon: Icons.lightbulb_outline,
-    iconColor: Colors.yellow,
-    duration: const Duration(seconds: 0),
-    timestamp: DateTime.now().subtract(const Duration(minutes: 10)),
-  ),
-  UsageEvent(
-    title: 'Instagram',
-    icon: Icons.camera_alt,
-    iconColor: Colors.pink,
-    duration: const Duration(seconds: 1),
-    timestamp: DateTime.now().subtract(const Duration(minutes: 10, seconds: 3)),
-  ),
-  UsageEvent(
-    title: 'Pantalla apagada (bloqueada)',
-    icon: Icons.phonelink_lock,
-    iconColor: Colors.grey,
-    duration: const Duration(seconds: 1),
-    timestamp: DateTime.now().subtract(const Duration(minutes: 10, seconds: 4)),
-  ),
-  UsageEvent(
-    title: 'Pantalla apagada (bloqueada)',
-    icon: Icons.phonelink_lock,
-    iconColor: Colors.grey,
-    duration: const Duration(minutes: 5, seconds: 9),
-    timestamp: DateTime.now().subtract(const Duration(minutes: 15)),
-  ),
-  UsageEvent(
-    title: 'Pantalla apagada (no bloqueada)',
-    icon: Icons.phone_android,
-    iconColor: Colors.grey,
-    duration: const Duration(seconds: 5),
-    timestamp: DateTime.now().subtract(const Duration(minutes: 15)),
-  ),
-  UsageEvent(
-    title: 'Instagram',
-    icon: Icons.camera_alt,
-    iconColor: Colors.pink,
-    duration: const Duration(minutes: 1, seconds: 2),
-    timestamp: DateTime.now().subtract(const Duration(minutes: 16)),
-  ),
-];
-
 
 void main() {
   runApp(const MyApp());
@@ -114,56 +47,162 @@ class UsageLogScreen extends StatefulWidget {
 }
 
 class _UsageLogScreenState extends State<UsageLogScreen> {
-  late final List<UsageEvent> _events;
+  // --- ここからが追加・変更部分 ---
+
+  List<UsageEvent> _events = []; // 表示するイベントリスト
+  bool _isLoading = true; // 読み込み状態を管理
 
   @override
   void initState() {
     super.initState();
-    // データを時間順（新しいものが上）にソート
-    _events = mockEvents..sort((a, b) => b.timestamp.compareTo(a.timestamp));
+    _loadUsageData(); // アプリ起動時にデータを読み込む
   }
+  
+  // あなたが見つけてくれたロジックを組み込んだ、データ取得メソッド
+  Future<void> _loadUsageData() async {
+    // 1. 権限の確認と要求
+    bool isPermission = await UsageStats.checkUsagePermission() ?? false;
+    if (!isPermission) {
+      // 権限がない場合は設定画面に遷移する
+      UsageStats.grantUsagePermission();
+      // この時点ではデータ取得はできないので一旦処理を終了
+      setState(() {
+        _isLoading = false;
+      });
+      return;
+    }
+
+    // 2. データの取得
+    try {
+      DateTime endDate = DateTime.now();
+      DateTime startDate = DateTime(endDate.year, endDate.month, endDate.day); // 今日の0時
+
+      // イベントリストを取得
+      List<EventUsageInfo> rawEvents = await UsageStats.queryEvents(startDate, endDate);
+
+      // 3. 取得した生データをUIで使えるUsageEventに変換
+      List<UsageEvent> newEvents = [];
+      // イベントをタイムスタンプの降順（新しいものが先）にソート
+      rawEvents.sort((a, b) => b.timeStamp!.compareTo(a.timeStamp!));
+
+      for (int i = 0; i < rawEvents.length; i++) {
+        final current = rawEvents[i];
+        Duration duration;
+
+        // 各イベントの継続時間を計算（次のイベントが起きるまでの時間）
+        if (i + 1 < rawEvents.length) {
+          final previous = rawEvents[i + 1];
+          duration = Duration(
+            milliseconds: int.parse(current.timeStamp!) - int.parse(previous.timeStamp!)
+          );
+        } else {
+          // リストの最後のイベントは継続時間0とする
+          duration = Duration.zero;
+        }
+
+        final appInfo = _getAppIconInfo(current.packageName!);
+
+        newEvents.add(
+          UsageEvent(
+            title: appInfo['name'], // パッケージ名からアプリ名を取得
+            icon: appInfo['icon'],
+            iconColor: appInfo['color'],
+            duration: duration,
+            timestamp: DateTime.fromMillisecondsSinceEpoch(int.parse(current.timeStamp!)),
+          ),
+        );
+      }
+      
+      setState(() {
+        _events = newEvents;
+        _isLoading = false;
+      });
+
+    } catch (err) {
+      // エラーハンドリング
+      debugPrint(err.toString());
+      setState(() {
+        _isLoading = false;
+      });
+    }
+  }
+  
+  // パッケージ名に応じて表示名やアイコンを返すヘルパー関数
+  Map<String, dynamic> _getAppIconInfo(String packageName) {
+    if (packageName.contains('instagram')) {
+      return {'name': 'Instagram', 'icon': Icons.camera_alt, 'color': Colors.pink};
+    }
+    if (packageName.contains('youtube')) {
+      return {'name': 'YouTube', 'icon': Icons.play_arrow, 'color': Colors.red};
+    }
+    if (packageName.contains('chrome')) {
+      return {'name': 'Chrome', 'icon': Icons.web, 'color': Colors.green};
+    }
+    if (packageName.contains('twitter') || packageName.contains('x.android')) {
+      return {'name': 'X (Twitter)', 'icon': Icons.close, 'color': Colors.white};
+    }
+    // ここでは画面ロックなどもパッケージ名として取得されることがある
+    // eventTypeを見て判定するのがより正確
+    if (packageName == 'android') {
+      return {'name': 'システムイベント', 'icon': Icons.android, 'color': Colors.grey};
+    }
+    return {'name': packageName, 'icon': Icons.app_blocking, 'color': Colors.grey};
+  }
+  
+  // --- ここまでが追加・変更部分 ---
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('利用ログ (プロトタイプ)'),
+        title: const Text('利用ログ（実際データ）'),
         backgroundColor: const Color(0xFF2D2F41),
         elevation: 1,
       ),
-      body: ListView.builder(
-        itemCount: _events.length,
-        itemBuilder: (context, index) {
-          final event = _events[index];
-          return TimelineTile(
-            alignment: TimelineAlign.manual,
-            lineXY: 0.2, // タイムラインを画面の20%の位置に表示
-            isFirst: index == 0,
-            isLast: index == _events.length - 1,
-            // タイムラインの線のスタイル
-            beforeLineStyle: const LineStyle(color: Colors.white54, thickness: 2),
-            afterLineStyle: const LineStyle(color: Colors.white54, thickness: 2),
-            // タイムライン上の丸（インジケーター）のスタイル
-            indicatorStyle: IndicatorStyle(
-              width: 15,
-              color: Colors.white54,
-              padding: const EdgeInsets.all(4),
-            ),
-            // 左側（時刻）のウィジェット
-            startChild: Text(
-              DateFormat('HH:mm').format(event.timestamp),
-              textAlign: TextAlign.center,
-              style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
-            ),
-            // 右側（イベント詳細）のウィジェット
-            endChild: _buildEventDetails(event),
-          );
-        },
+      // データを読み込み中か、データが空かで表示を切り替える
+      body: _isLoading
+          ? const Center(child: CircularProgressIndicator())
+          : _events.isEmpty
+              ? Center(
+                  child: Text(
+                    'データがありません。\n権限を許可してください。',
+                    textAlign: TextAlign.center,
+                  ),
+                )
+              : ListView.builder(
+                  itemCount: _events.length,
+                  itemBuilder: (context, index) {
+                    final event = _events[index];
+                    return TimelineTile(
+                      alignment: TimelineAlign.manual,
+                      lineXY: 0.2,
+                      isFirst: index == 0,
+                      isLast: index == _events.length - 1,
+                      beforeLineStyle: const LineStyle(color: Colors.white54, thickness: 2),
+                      afterLineStyle: const LineStyle(color: Colors.white54, thickness: 2),
+                      indicatorStyle: IndicatorStyle(
+                        width: 15,
+                        color: Colors.white54,
+                        padding: const EdgeInsets.all(4),
+                      ),
+                      startChild: Text(
+                        DateFormat('HH:mm:ss').format(event.timestamp),
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 12),
+                      ),
+                      endChild: _buildEventDetails(event),
+                    );
+                  },
+                ),
+      // 更新ボタンを追加
+      floatingActionButton: FloatingActionButton(
+        onPressed: _loadUsageData,
+        child: const Icon(Icons.refresh),
       ),
     );
   }
 
-  // イベント詳細部分のUIを生成するメソッド
+  // --- 以下のメソッドは変更なし ---
   Widget _buildEventDetails(UsageEvent event) {
     return Padding(
       padding: const EdgeInsets.all(16.0),
@@ -191,10 +230,9 @@ class _UsageLogScreenState extends State<UsageLogScreen> {
       ),
     );
   }
-
-  // Duration型を「X分Y秒」の文字列に変換するヘルパー関数
+  
   String _formatDuration(Duration d) {
-    if (d.inSeconds < 0) return '';
+    if (d.inSeconds <= 0) return '一瞬'; // 0秒以下の場合は「一瞬」と表示
     final minutes = d.inMinutes;
     final seconds = d.inSeconds % 60;
     String result = '';
