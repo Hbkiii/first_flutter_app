@@ -1,3 +1,4 @@
+import 'dart:async'; // タイマー機能を使うためにインポート
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import 'package:timeline_tile/timeline_tile.dart';
@@ -48,20 +49,43 @@ class UsageLogScreen extends StatefulWidget {
 class _UsageLogScreenState extends State<UsageLogScreen> {
   Map<String, List<UsageEvent>> _groupedEvents = {};
   bool _isLoading = true;
+  Timer? _timer; // --- 自動更新用のタイマー ---
 
   @override
   void initState() {
     super.initState();
-    _loadUsageData();
+    // 最初に一度、手動更新と同じ処理を呼び出す
+    _loadUsageData(isManualRefresh: true);
+    // --- ★★★ 自動更新タイマーを開始 ★★★ ---
+    _startAutoUpdateTimer();
   }
 
-  Future<void> _loadUsageData() async {
-    setState(() { _isLoading = true; });
+  @override
+  void dispose() {
+    _timer?.cancel(); // 画面が閉じられるときにタイマーを停止
+    super.dispose();
+  }
+  
+  // --- ★★★ 15秒ごとに全データを再取得するタイマー ★★★ ---
+  void _startAutoUpdateTimer() {
+    _timer?.cancel();
+    _timer = Timer.periodic(const Duration(seconds: 5), (timer) {
+      // 15秒ごとに、裏側でデータを読み込む（読み込み中は表示しない）
+      _loadUsageData(isManualRefresh: false);
+    });
+  }
+
+  // --- isManualRefresh という引数を追加 ---
+  Future<void> _loadUsageData({required bool isManualRefresh}) async {
+    // 手動更新の時だけ、くるくるマークを表示する
+    if (isManualRefresh) {
+      setState(() { _isLoading = true; });
+    }
 
     bool isPermission = await UsageStats.checkUsagePermission() ?? false;
     if (!isPermission) {
       UsageStats.grantUsagePermission();
-      setState(() { _isLoading = false; });
+      if (isManualRefresh) { setState(() { _isLoading = false; }); }
       return;
     }
 
@@ -70,27 +94,20 @@ class _UsageLogScreenState extends State<UsageLogScreen> {
       DateTime startDate = endDate.subtract(const Duration(days: 7));
       List<EventUsageInfo> rawEvents = await UsageStats.queryEvents(startDate, endDate);
 
-      // --- ★★★ ここからが新しいフィルタリングロジック ★★★ ---
-
-      // 1. 「アプリが最前面に来た」イベントだけに絞り込む
       List<EventUsageInfo> foregroundEvents = rawEvents.where((event) {
-        // 'ACTIVITY_RESUMED' がユーザーがアプリを操作し始めた瞬間のイベント
         return event.eventType == '1';
       }).toList();
 
-      // 2. 不要なシステムアプリなどを除外
       const List<String> blockList = [
-        'android', 'com.android.systemui', 'com.google.android.apps.nexuslauncher',
-        'com.sec.android.app.launcher', 'com.mi.android.globallauncher',
+        'android', 'com.android.systemui', 
         'com.google.android.inputmethod.latin', 'com.android.vending',
         'com.google.android.deskclock', 'com.google.android.apps.messaging',
       ];
       List<EventUsageInfo> filteredEvents = foregroundEvents.where((event) {
         if (event.packageName == null) return false;
+        if (event.packageName == 'com.example.flutter_application_1') return true;
         return !blockList.any((item) => event.packageName!.startsWith(item));
       }).toList();
-
-      // --- ★★★ ここから下のセッション化ロジックは前回と同じ ★★★ ---
 
       filteredEvents.sort((a, b) => a.timeStamp!.compareTo(b.timeStamp!));
 
@@ -132,9 +149,7 @@ class _UsageLogScreenState extends State<UsageLogScreen> {
           timestamp: timestamp,
         );
         
-        if (tempGroupedEvents[dateKey] == null) {
-          tempGroupedEvents[dateKey] = [];
-        }
+        if (tempGroupedEvents[dateKey] == null) { tempGroupedEvents[dateKey] = []; }
         tempGroupedEvents[dateKey]!.add(event);
       }
 
@@ -149,7 +164,7 @@ class _UsageLogScreenState extends State<UsageLogScreen> {
 
     } catch (err) {
       debugPrint(err.toString());
-      setState(() { _isLoading = false; });
+      if (isManualRefresh) { setState(() { _isLoading = false; }); }
     }
   }
 
@@ -159,6 +174,8 @@ class _UsageLogScreenState extends State<UsageLogScreen> {
     if (packageName.contains('chrome')) { return {'name': 'Chrome', 'icon': Icons.web, 'color': Colors.green}; }
     if (packageName.contains('twitter') || packageName.contains('x.android')) { return {'name': 'X (Twitter)', 'icon': Icons.close, 'color': Colors.white}; }
     if (packageName.contains('camera')) { return {'name': 'カメラ', 'icon': Icons.camera, 'color': Colors.lightBlue}; }
+    if (packageName.contains('com.example.flutter_application_1')) { return {'name': '開発中のアプリ', 'icon': Icons.adb, 'color': Colors.cyan}; }
+    if (packageName.contains('launcher')) { return {'name': 'ホーム', 'icon': Icons.home, 'color': const Color.fromARGB(255, 38, 255, 110)}; }
     return {'name': packageName, 'icon': Icons.app_blocking, 'color': Colors.grey};
   }
   
@@ -169,16 +186,14 @@ class _UsageLogScreenState extends State<UsageLogScreen> {
       
     return Scaffold(
       appBar: AppBar(
-        title: const Text('アプリ利用ログ（プロトタイプ０１）'),
+        title: const Text('利用ログ'),
         backgroundColor: const Color(0xFF2D2F41),
         elevation: 1,
       ),
       body: _isLoading
           ? const Center(child: CircularProgressIndicator())
           : _groupedEvents.isEmpty
-              ? Center(
-                  child: Text('データがありません。\n権限を許可し、更新ボタンを押してください。', textAlign: TextAlign.center),
-                )
+              ? Center( child: Text('データがありません。\n権限を許可し、更新ボタンを押してください。', textAlign: TextAlign.center),)
               : ListView.builder(
                   itemCount: dateKeys.length,
                   itemBuilder: (context, index) {
@@ -209,15 +224,9 @@ class _UsageLogScreenState extends State<UsageLogScreen> {
                               beforeLineStyle: const LineStyle(color: Colors.white54, thickness: 2),
                               afterLineStyle: const LineStyle(color: Colors.white54, thickness: 2),
                               indicatorStyle: IndicatorStyle(
-                                width: 15,
-                                color: Colors.white54,
-                                padding: const EdgeInsets.all(4),
-                              ),
-                              startChild: Text(
-                                DateFormat('HH:mm').format(event.timestamp),
-                                textAlign: TextAlign.center,
-                                style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 12),
-                              ),
+                                width: 15, color: Colors.white54, padding: const EdgeInsets.all(4),),
+                              startChild: Text( DateFormat('HH:mm').format(event.timestamp), textAlign: TextAlign.center,
+                                style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 12),),
                               endChild: _buildEventDetails(event),
                             );
                           },
@@ -227,7 +236,8 @@ class _UsageLogScreenState extends State<UsageLogScreen> {
                   },
                 ),
       floatingActionButton: FloatingActionButton(
-        onPressed: _loadUsageData,
+        // 右下のボタンは、手動更新として明示的に呼び出す
+        onPressed: () => _loadUsageData(isManualRefresh: true),
         child: const Icon(Icons.refresh),
       ),
     );
