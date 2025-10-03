@@ -1,9 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import 'package:timeline_tile/timeline_tile.dart';
-import 'package:usage_stats/usage_stats.dart'; // usage_statsプラグインをインポート
+import 'package:usage_stats/usage_stats.dart';
 
-// UsageEventクラスの定義（変更なし）
 class UsageEvent {
   final String title;
   final IconData icon;
@@ -47,162 +46,193 @@ class UsageLogScreen extends StatefulWidget {
 }
 
 class _UsageLogScreenState extends State<UsageLogScreen> {
-  // --- ここからが追加・変更部分 ---
-
-  List<UsageEvent> _events = []; // 表示するイベントリスト
-  bool _isLoading = true; // 読み込み状態を管理
+  Map<String, List<UsageEvent>> _groupedEvents = {};
+  bool _isLoading = true;
 
   @override
   void initState() {
     super.initState();
-    _loadUsageData(); // アプリ起動時にデータを読み込む
+    _loadUsageData();
   }
-  
-  // あなたが見つけてくれたロジックを組み込んだ、データ取得メソッド
+
   Future<void> _loadUsageData() async {
-    // 1. 権限の確認と要求
+    setState(() { _isLoading = true; });
+
     bool isPermission = await UsageStats.checkUsagePermission() ?? false;
     if (!isPermission) {
-      // 権限がない場合は設定画面に遷移する
       UsageStats.grantUsagePermission();
-      // この時点ではデータ取得はできないので一旦処理を終了
-      setState(() {
-        _isLoading = false;
-      });
+      setState(() { _isLoading = false; });
       return;
     }
 
-    // 2. データの取得
     try {
       DateTime endDate = DateTime.now();
-      DateTime startDate = DateTime(endDate.year, endDate.month, endDate.day); // 今日の0時
-
-      // イベントリストを取得
+      DateTime startDate = endDate.subtract(const Duration(days: 7));
       List<EventUsageInfo> rawEvents = await UsageStats.queryEvents(startDate, endDate);
 
-      // 3. 取得した生データをUIで使えるUsageEventに変換
-      List<UsageEvent> newEvents = [];
-      // イベントをタイムスタンプの降順（新しいものが先）にソート
-      rawEvents.sort((a, b) => b.timeStamp!.compareTo(a.timeStamp!));
+      // --- ★★★ ここからが新しいフィルタリングロジック ★★★ ---
 
-      for (int i = 0; i < rawEvents.length; i++) {
-        final current = rawEvents[i];
-        Duration duration;
+      // 1. 「アプリが最前面に来た」イベントだけに絞り込む
+      List<EventUsageInfo> foregroundEvents = rawEvents.where((event) {
+        // 'ACTIVITY_RESUMED' がユーザーがアプリを操作し始めた瞬間のイベント
+        return event.eventType == '1';
+      }).toList();
 
-        // 各イベントの継続時間を計算（次のイベントが起きるまでの時間）
-        if (i + 1 < rawEvents.length) {
-          final previous = rawEvents[i + 1];
-          duration = Duration(
-            milliseconds: int.parse(current.timeStamp!) - int.parse(previous.timeStamp!)
-          );
-        } else {
-          // リストの最後のイベントは継続時間0とする
-          duration = Duration.zero;
+      // 2. 不要なシステムアプリなどを除外
+      const List<String> blockList = [
+        'android', 'com.android.systemui', 'com.google.android.apps.nexuslauncher',
+        'com.sec.android.app.launcher', 'com.mi.android.globallauncher',
+        'com.google.android.inputmethod.latin', 'com.android.vending',
+        'com.google.android.deskclock', 'com.google.android.apps.messaging',
+      ];
+      List<EventUsageInfo> filteredEvents = foregroundEvents.where((event) {
+        if (event.packageName == null) return false;
+        return !blockList.any((item) => event.packageName!.startsWith(item));
+      }).toList();
+
+      // --- ★★★ ここから下のセッション化ロジックは前回と同じ ★★★ ---
+
+      filteredEvents.sort((a, b) => a.timeStamp!.compareTo(b.timeStamp!));
+
+      List<EventUsageInfo> sessionStartEvents = [];
+      if (filteredEvents.isNotEmpty) {
+        sessionStartEvents.add(filteredEvents.first);
+        for (int i = 1; i < filteredEvents.length; i++) {
+          if (filteredEvents[i].packageName != filteredEvents[i - 1].packageName) {
+            sessionStartEvents.add(filteredEvents[i]);
+          }
         }
-
-        final appInfo = _getAppIconInfo(current.packageName!);
-
-        newEvents.add(
-          UsageEvent(
-            title: appInfo['name'], // パッケージ名からアプリ名を取得
-            icon: appInfo['icon'],
-            iconColor: appInfo['color'],
-            duration: duration,
-            timestamp: DateTime.fromMillisecondsSinceEpoch(int.parse(current.timeStamp!)),
-          ),
-        );
       }
       
+      Map<String, List<UsageEvent>> tempGroupedEvents = {};
+      for (int i = 0; i < sessionStartEvents.length; i++) {
+        final currentSession = sessionStartEvents[i];
+        Duration duration;
+
+        if (i < sessionStartEvents.length - 1) {
+          final nextSession = sessionStartEvents[i + 1];
+          duration = Duration(
+            milliseconds: int.parse(nextSession.timeStamp!) - int.parse(currentSession.timeStamp!)
+          );
+        } else {
+          duration = DateTime.now().difference(
+            DateTime.fromMillisecondsSinceEpoch(int.parse(currentSession.timeStamp!))
+          );
+        }
+
+        final timestamp = DateTime.fromMillisecondsSinceEpoch(int.parse(currentSession.timeStamp!));
+        final dateKey = DateFormat('yyyy年MM月dd日').format(timestamp);
+        final appInfo = _getAppIconInfo(currentSession.packageName!);
+
+        final event = UsageEvent(
+          title: appInfo['name'],
+          icon: appInfo['icon'],
+          iconColor: appInfo['color'],
+          duration: duration,
+          timestamp: timestamp,
+        );
+        
+        if (tempGroupedEvents[dateKey] == null) {
+          tempGroupedEvents[dateKey] = [];
+        }
+        tempGroupedEvents[dateKey]!.add(event);
+      }
+
+      tempGroupedEvents.forEach((key, value) {
+        tempGroupedEvents[key] = value.reversed.toList();
+      });
+
       setState(() {
-        _events = newEvents;
+        _groupedEvents = tempGroupedEvents;
         _isLoading = false;
       });
 
     } catch (err) {
-      // エラーハンドリング
       debugPrint(err.toString());
-      setState(() {
-        _isLoading = false;
-      });
+      setState(() { _isLoading = false; });
     }
   }
-  
-  // パッケージ名に応じて表示名やアイコンを返すヘルパー関数
+
   Map<String, dynamic> _getAppIconInfo(String packageName) {
-    if (packageName.contains('instagram')) {
-      return {'name': 'Instagram', 'icon': Icons.camera_alt, 'color': Colors.pink};
-    }
-    if (packageName.contains('youtube')) {
-      return {'name': 'YouTube', 'icon': Icons.play_arrow, 'color': Colors.red};
-    }
-    if (packageName.contains('chrome')) {
-      return {'name': 'Chrome', 'icon': Icons.web, 'color': Colors.green};
-    }
-    if (packageName.contains('twitter') || packageName.contains('x.android')) {
-      return {'name': 'X (Twitter)', 'icon': Icons.close, 'color': Colors.white};
-    }
-    // ここでは画面ロックなどもパッケージ名として取得されることがある
-    // eventTypeを見て判定するのがより正確
-    if (packageName == 'android') {
-      return {'name': 'システムイベント', 'icon': Icons.android, 'color': Colors.grey};
-    }
+    if (packageName.contains('instagram')) { return {'name': 'Instagram', 'icon': Icons.camera_alt, 'color': Colors.pink}; }
+    if (packageName.contains('youtube')) { return {'name': 'YouTube', 'icon': Icons.play_arrow, 'color': Colors.red}; }
+    if (packageName.contains('chrome')) { return {'name': 'Chrome', 'icon': Icons.web, 'color': Colors.green}; }
+    if (packageName.contains('twitter') || packageName.contains('x.android')) { return {'name': 'X (Twitter)', 'icon': Icons.close, 'color': Colors.white}; }
+    if (packageName.contains('camera')) { return {'name': 'カメラ', 'icon': Icons.camera, 'color': Colors.lightBlue}; }
     return {'name': packageName, 'icon': Icons.app_blocking, 'color': Colors.grey};
   }
   
-  // --- ここまでが追加・変更部分 ---
-
   @override
   Widget build(BuildContext context) {
+    final dateKeys = _groupedEvents.keys.toList()
+      ..sort((a, b) => DateFormat('yyyy年MM月dd日').parse(b).compareTo(DateFormat('yyyy年MM月dd日').parse(a)));
+      
     return Scaffold(
       appBar: AppBar(
-        title: const Text('利用ログ（実際データ）'),
+        title: const Text('アプリ利用ログ（プロトタイプ０１）'),
         backgroundColor: const Color(0xFF2D2F41),
         elevation: 1,
       ),
-      // データを読み込み中か、データが空かで表示を切り替える
       body: _isLoading
           ? const Center(child: CircularProgressIndicator())
-          : _events.isEmpty
+          : _groupedEvents.isEmpty
               ? Center(
-                  child: Text(
-                    'データがありません。\n権限を許可してください。',
-                    textAlign: TextAlign.center,
-                  ),
+                  child: Text('データがありません。\n権限を許可し、更新ボタンを押してください。', textAlign: TextAlign.center),
                 )
               : ListView.builder(
-                  itemCount: _events.length,
+                  itemCount: dateKeys.length,
                   itemBuilder: (context, index) {
-                    final event = _events[index];
-                    return TimelineTile(
-                      alignment: TimelineAlign.manual,
-                      lineXY: 0.2,
-                      isFirst: index == 0,
-                      isLast: index == _events.length - 1,
-                      beforeLineStyle: const LineStyle(color: Colors.white54, thickness: 2),
-                      afterLineStyle: const LineStyle(color: Colors.white54, thickness: 2),
-                      indicatorStyle: IndicatorStyle(
-                        width: 15,
-                        color: Colors.white54,
-                        padding: const EdgeInsets.all(4),
-                      ),
-                      startChild: Text(
-                        DateFormat('HH:mm:ss').format(event.timestamp),
-                        textAlign: TextAlign.center,
-                        style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 12),
-                      ),
-                      endChild: _buildEventDetails(event),
+                    final dateKey = dateKeys[index];
+                    final eventsForDay = _groupedEvents[dateKey]!;
+                    
+                    return Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Padding(
+                          padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
+                          child: Text(
+                            dateKey,
+                            style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Colors.white),
+                          ),
+                        ),
+                        ListView.builder(
+                          shrinkWrap: true,
+                          physics: const NeverScrollableScrollPhysics(),
+                          itemCount: eventsForDay.length,
+                          itemBuilder: (context, eventIndex) {
+                            final event = eventsForDay[eventIndex];
+                            return TimelineTile(
+                              alignment: TimelineAlign.manual,
+                              lineXY: 0.2,
+                              isFirst: eventIndex == 0,
+                              isLast: eventIndex == eventsForDay.length - 1,
+                              beforeLineStyle: const LineStyle(color: Colors.white54, thickness: 2),
+                              afterLineStyle: const LineStyle(color: Colors.white54, thickness: 2),
+                              indicatorStyle: IndicatorStyle(
+                                width: 15,
+                                color: Colors.white54,
+                                padding: const EdgeInsets.all(4),
+                              ),
+                              startChild: Text(
+                                DateFormat('HH:mm').format(event.timestamp),
+                                textAlign: TextAlign.center,
+                                style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 12),
+                              ),
+                              endChild: _buildEventDetails(event),
+                            );
+                          },
+                        ),
+                      ],
                     );
                   },
                 ),
-      // 更新ボタンを追加
       floatingActionButton: FloatingActionButton(
         onPressed: _loadUsageData,
         child: const Icon(Icons.refresh),
       ),
     );
   }
-
-  // --- 以下のメソッドは変更なし ---
+  
   Widget _buildEventDetails(UsageEvent event) {
     return Padding(
       padding: const EdgeInsets.all(16.0),
@@ -232,14 +262,16 @@ class _UsageLogScreenState extends State<UsageLogScreen> {
   }
   
   String _formatDuration(Duration d) {
-    if (d.inSeconds <= 0) return '一瞬'; // 0秒以下の場合は「一瞬」と表示
+    if (d.inSeconds <= 0) return '一瞬';
     final minutes = d.inMinutes;
     final seconds = d.inSeconds % 60;
     String result = '';
     if (minutes > 0) {
       result += '$minutes分 ';
     }
-    result += '$seconds秒';
-    return result;
+    if (minutes < 1 && seconds > 0) {
+      result += '$seconds秒';
+    }
+    return result.isEmpty ? '一瞬' : result.trim();
   }
 }
