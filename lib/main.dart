@@ -68,7 +68,7 @@ class _UsageLogScreenState extends State<UsageLogScreen> {
   }
 
   void _startAutoUpdateTimer() {
-    _timer = Timer.periodic(const Duration(seconds: 15), (timer) {
+    _timer = Timer.periodic(const Duration(seconds: 5), (timer) {
       _syncAndReloadData(); // 15秒ごとに同期と再読み込み
     });
   }
