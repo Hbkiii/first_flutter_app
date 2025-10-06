@@ -1,10 +1,8 @@
-import 'dart:async';
+import 'dart:async'; // タイマー機能を使うためにインポート
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import 'package:timeline_tile/timeline_tile.dart';
 import 'package:usage_stats/usage_stats.dart';
-
-import 'database_helper.dart'; // 作成したヘルパーファイルをインポート
 
 class UsageEvent {
   final String title;
@@ -23,7 +21,6 @@ class UsageEvent {
 }
 
 void main() {
-  WidgetsFlutterBinding.ensureInitialized(); // mainで非同期処理を呼ぶためのおまじない
   runApp(const MyApp());
 }
 
@@ -52,32 +49,43 @@ class UsageLogScreen extends StatefulWidget {
 class _UsageLogScreenState extends State<UsageLogScreen> {
   Map<String, List<UsageEvent>> _groupedEvents = {};
   bool _isLoading = true;
-  Timer? _timer;
+  Timer? _timer; // --- 自動更新用のタイマー ---
 
   @override
   void initState() {
     super.initState();
-    _loadDataFromDb(); // 最初にDBからデータを読み込む
-    _startAutoUpdateTimer(); // 自動更新タイマーを開始
+    // 最初に一度、手動更新と同じ処理を呼び出す
+    _loadUsageData(isManualRefresh: true);
+    // --- ★★★ 自動更新タイマーを開始 ★★★ ---
+    _startAutoUpdateTimer();
   }
 
   @override
   void dispose() {
-    _timer?.cancel();
+    _timer?.cancel(); // 画面が閉じられるときにタイマーを停止
     super.dispose();
   }
-
+  
+  // --- ★★★ 15秒ごとに全データを再取得するタイマー ★★★ ---
   void _startAutoUpdateTimer() {
-    _timer = Timer.periodic(const Duration(seconds: 15), (timer) {
-      _syncAndReloadData(); // 15秒ごとに同期と再読み込み
+    _timer?.cancel();
+    _timer = Timer.periodic(const Duration(seconds: 5), (timer) {
+      // 15秒ごとに、裏側でデータを読み込む（読み込み中は表示しない）
+      _loadUsageData(isManualRefresh: false);
     });
   }
 
-  // ★★★ APIからデータを取得し、DBに保存し、画面を更新する一連の処理 ★★★
-  Future<void> _syncAndReloadData() async {
+  // --- isManualRefresh という引数を追加 ---
+  Future<void> _loadUsageData({required bool isManualRefresh}) async {
+    // 手動更新の時だけ、くるくるマークを表示する
+    if (isManualRefresh) {
+      setState(() { _isLoading = true; });
+    }
+
     bool isPermission = await UsageStats.checkUsagePermission() ?? false;
     if (!isPermission) {
       UsageStats.grantUsagePermission();
+      if (isManualRefresh) { setState(() { _isLoading = false; }); }
       return;
     }
 
@@ -86,96 +94,79 @@ class _UsageLogScreenState extends State<UsageLogScreen> {
       DateTime startDate = endDate.subtract(const Duration(days: 7));
       List<EventUsageInfo> rawEvents = await UsageStats.queryEvents(startDate, endDate);
 
-      final dbHelper = DatabaseHelper.instance;
-      for (var event in rawEvents) {
-        if (event.timeStamp != null && event.packageName != null && event.eventType != null) {
-          final model = UsageEventModel(
-            packageName: event.packageName!,
-            eventType: event.eventType!,
-            timestamp: int.parse(event.timeStamp!),
+      List<EventUsageInfo> foregroundEvents = rawEvents.where((event) {
+        return event.eventType == '1';
+      }).toList();
+
+      const List<String> blockList = [
+        'android', 'com.android.systemui', 
+        'com.google.android.inputmethod.latin', 'com.android.vending',
+        'com.google.android.deskclock', 'com.google.android.apps.messaging',
+      ];
+      List<EventUsageInfo> filteredEvents = foregroundEvents.where((event) {
+        if (event.packageName == null) return false;
+        if (event.packageName == 'com.example.flutter_application_1') return true;
+        return !blockList.any((item) => event.packageName!.startsWith(item));
+      }).toList();
+
+      filteredEvents.sort((a, b) => a.timeStamp!.compareTo(b.timeStamp!));
+
+      List<EventUsageInfo> sessionStartEvents = [];
+      if (filteredEvents.isNotEmpty) {
+        sessionStartEvents.add(filteredEvents.first);
+        for (int i = 1; i < filteredEvents.length; i++) {
+          if (filteredEvents[i].packageName != filteredEvents[i - 1].packageName) {
+            sessionStartEvents.add(filteredEvents[i]);
+          }
+        }
+      }
+      
+      Map<String, List<UsageEvent>> tempGroupedEvents = {};
+      for (int i = 0; i < sessionStartEvents.length; i++) {
+        final currentSession = sessionStartEvents[i];
+        Duration duration;
+
+        if (i < sessionStartEvents.length - 1) {
+          final nextSession = sessionStartEvents[i + 1];
+          duration = Duration(
+            milliseconds: int.parse(nextSession.timeStamp!) - int.parse(currentSession.timeStamp!)
           );
-          await dbHelper.insert(model);
+        } else {
+          duration = DateTime.now().difference(
+            DateTime.fromMillisecondsSinceEpoch(int.parse(currentSession.timeStamp!))
+          );
         }
+
+        final timestamp = DateTime.fromMillisecondsSinceEpoch(int.parse(currentSession.timeStamp!));
+        final dateKey = DateFormat('yyyy年MM月dd日').format(timestamp);
+        final appInfo = _getAppIconInfo(currentSession.packageName!);
+
+        final event = UsageEvent(
+          title: appInfo['name'],
+          icon: appInfo['icon'],
+          iconColor: appInfo['color'],
+          duration: duration,
+          timestamp: timestamp,
+        );
+        
+        if (tempGroupedEvents[dateKey] == null) { tempGroupedEvents[dateKey] = []; }
+        tempGroupedEvents[dateKey]!.add(event);
       }
-      // DBへの保存が完了したら、DBから再度読み込んで画面を更新
-      await _loadDataFromDb();
-      
+
+      tempGroupedEvents.forEach((key, value) {
+        tempGroupedEvents[key] = value.reversed.toList();
+      });
+
+      setState(() {
+        _groupedEvents = tempGroupedEvents;
+        _isLoading = false;
+      });
+
     } catch (err) {
-      debugPrint("Error syncing data: $err");
+      debugPrint(err.toString());
+      if (isManualRefresh) { setState(() { _isLoading = false; }); }
     }
   }
-
-  // ★★★ データベースからデータを読み込んで画面表示用のデータに加工する処理 ★★★
-  Future<void> _loadDataFromDb({bool showLoading = false}) async {
-    if (showLoading) { setState(() { _isLoading = true; }); }
-    
-    final dbHelper = DatabaseHelper.instance;
-    DateTime endDate = DateTime.now();
-    DateTime startDate = endDate.subtract(const Duration(days: 7));
-    
-    List<UsageEventModel> eventsFromDb = await dbHelper.queryAllEvents(startDate, endDate);
-
-    // --- ここから下のデータ加工ロジックは、DBから読み込んだデータを使う以外は前回とほぼ同じ ---
-    List<UsageEventModel> foregroundEvents = eventsFromDb.where((event) {
-      return event.eventType == '1';
-    }).toList();
-
-    const List<String> blockList = [
-      'android', 'com.android.systemui',
-      'com.sec.android.app.launcher', 'com.mi.android.globallauncher',
-      'com.google.android.inputmethod.latin', 'com.android.vending',
-      'com.google.android.deskclock', 'com.google.android.apps.messaging',
-    ];
-    List<UsageEventModel> filteredEvents = foregroundEvents.where((event) {
-      if (event.packageName == 'com.example.flutter_application_1') return true;
-      return !blockList.any((item) => event.packageName.startsWith(item));
-    }).toList();
-
-    List<UsageEventModel> sessionStartEvents = [];
-    if (filteredEvents.isNotEmpty) {
-      sessionStartEvents.add(filteredEvents.first);
-      for (int i = 1; i < filteredEvents.length; i++) {
-        if (filteredEvents[i].packageName != filteredEvents[i - 1].packageName) {
-          sessionStartEvents.add(filteredEvents[i]);
-        }
-      }
-    }
-    
-    Map<String, List<UsageEvent>> tempGroupedEvents = {};
-    for (int i = 0; i < sessionStartEvents.length; i++) {
-      final currentSession = sessionStartEvents[i];
-      Duration duration;
-
-      if (i < sessionStartEvents.length - 1) {
-        final nextSession = sessionStartEvents[i + 1];
-        duration = Duration(milliseconds: nextSession.timestamp - currentSession.timestamp);
-      } else {
-        duration = DateTime.now().difference(DateTime.fromMillisecondsSinceEpoch(currentSession.timestamp));
-      }
-
-      final timestamp = DateTime.fromMillisecondsSinceEpoch(currentSession.timestamp);
-      final dateKey = DateFormat('yyyy年MM月dd日').format(timestamp);
-      final appInfo = _getAppIconInfo(currentSession.packageName);
-
-      final event = UsageEvent(
-        title: appInfo['name'], icon: appInfo['icon'], iconColor: appInfo['color'],
-        duration: duration, timestamp: timestamp,
-      );
-      
-      if (tempGroupedEvents[dateKey] == null) { tempGroupedEvents[dateKey] = []; }
-      tempGroupedEvents[dateKey]!.add(event);
-    }
-
-    tempGroupedEvents.forEach((key, value) {
-      tempGroupedEvents[key] = value.reversed.toList();
-    });
-
-    setState(() {
-      _groupedEvents = tempGroupedEvents;
-      _isLoading = false;
-    });
-  }
-
 
   Map<String, dynamic> _getAppIconInfo(String packageName) {
     if (packageName.contains('instagram')) { return {'name': 'Instagram', 'icon': Icons.camera_alt, 'color': Colors.pink}; }
@@ -184,8 +175,7 @@ class _UsageLogScreenState extends State<UsageLogScreen> {
     if (packageName.contains('twitter') || packageName.contains('x.android')) { return {'name': 'X (Twitter)', 'icon': Icons.close, 'color': Colors.white}; }
     if (packageName.contains('camera')) { return {'name': 'カメラ', 'icon': Icons.camera, 'color': Colors.lightBlue}; }
     if (packageName.contains('com.example.flutter_application_1')) { return {'name': '開発中のアプリ', 'icon': Icons.adb, 'color': Colors.cyan}; }
-    if (packageName.contains('nexuslauncher')) { return {'name': 'ホーム', 'icon': Icons.home, 'color': const Color.fromARGB(255, 21, 197, 50)}; }
-    
+    if (packageName.contains('launcher')) { return {'name': 'ホーム', 'icon': Icons.home, 'color': const Color.fromARGB(255, 38, 255, 110)}; }
     return {'name': packageName, 'icon': Icons.app_blocking, 'color': Colors.grey};
   }
   
@@ -196,7 +186,7 @@ class _UsageLogScreenState extends State<UsageLogScreen> {
       
     return Scaffold(
       appBar: AppBar(
-        title: const Text('利用ログ (SQLite)'),
+        title: const Text('利用ログ'),
         backgroundColor: const Color(0xFF2D2F41),
         elevation: 1,
       ),
@@ -246,7 +236,8 @@ class _UsageLogScreenState extends State<UsageLogScreen> {
                   },
                 ),
       floatingActionButton: FloatingActionButton(
-        onPressed: () => _loadDataFromDb(showLoading: true), // ボタンはDBから読み込むだけ
+        // 右下のボタンは、手動更新として明示的に呼び出す
+        onPressed: () => _loadUsageData(isManualRefresh: true),
         child: const Icon(Icons.refresh),
       ),
     );
@@ -285,8 +276,12 @@ class _UsageLogScreenState extends State<UsageLogScreen> {
     final minutes = d.inMinutes;
     final seconds = d.inSeconds % 60;
     String result = '';
-    if (minutes > 0) { result += '$minutes分 '; }
-    if (minutes < 1 && seconds > 0) { result += '$seconds秒'; }
+    if (minutes > 0) {
+      result += '$minutes分 ';
+    }
+    if (minutes < 1 && seconds > 0) {
+      result += '$seconds秒';
+    }
     return result.isEmpty ? '一瞬' : result.trim();
   }
 }
