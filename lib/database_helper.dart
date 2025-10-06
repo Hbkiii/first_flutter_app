@@ -41,7 +41,7 @@ class DatabaseHelper {
   }
 
   // データベースを初期化する
-  _initDatabase() async {
+  Future<Database> _initDatabase() async {
     String path = join(await getDatabasesPath(), _databaseName);
     return await openDatabase(path,
         version: _databaseVersion,
