@@ -22,3 +22,14 @@ subprojects {
 tasks.register<Delete>("clean") {
     delete(rootProject.layout.buildDirectory)
 }
+
+// --- ここから下をファイルの末尾に追記 ---
+subprojects {
+    afterEvaluate {project ->
+        if (project.hasProperty('android')) {
+            android {
+                compileSdkVersion 36
+            }
+        }
+    }
+}

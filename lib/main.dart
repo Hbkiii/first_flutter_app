@@ -23,7 +23,7 @@ class UsageEvent {
 }
 
 void main() {
-  WidgetsFlutterBinding.ensureInitialized(); // mainで非同期処理を呼ぶためのおまじない
+  WidgetsFlutterBinding.ensureInitialized();
   runApp(const MyApp());
 }
 
@@ -53,12 +53,13 @@ class _UsageLogScreenState extends State<UsageLogScreen> {
   Map<String, List<UsageEvent>> _groupedEvents = {};
   bool _isLoading = true;
   Timer? _timer;
+  Set<String> _expandedDateKeys = {};
 
   @override
   void initState() {
     super.initState();
-    _loadDataFromDb(); // 最初にDBからデータを読み込む
-    _startAutoUpdateTimer(); // 自動更新タイマーを開始
+    _loadDataFromDb(showLoading: true);
+    _startAutoUpdateTimer();
   }
 
   @override
@@ -68,24 +69,22 @@ class _UsageLogScreenState extends State<UsageLogScreen> {
   }
 
   void _startAutoUpdateTimer() {
+    // --- ★★★ 修正点①: 自動更新を5秒に変更 ★★★ ---
     _timer = Timer.periodic(const Duration(seconds: 5), (timer) {
-      _syncAndReloadData(); // 15秒ごとに同期と再読み込み
+       _syncAndReloadData();
     });
   }
 
-  // ★★★ APIからデータを取得し、DBに保存し、画面を更新する一連の処理 ★★★
   Future<void> _syncAndReloadData() async {
     bool isPermission = await UsageStats.checkUsagePermission() ?? false;
     if (!isPermission) {
       UsageStats.grantUsagePermission();
       return;
     }
-
     try {
       DateTime endDate = DateTime.now();
       DateTime startDate = endDate.subtract(const Duration(days: 7));
       List<EventUsageInfo> rawEvents = await UsageStats.queryEvents(startDate, endDate);
-
       final dbHelper = DatabaseHelper.instance;
       for (var event in rawEvents) {
         if (event.timeStamp != null && event.packageName != null && event.eventType != null) {
@@ -97,15 +96,12 @@ class _UsageLogScreenState extends State<UsageLogScreen> {
           await dbHelper.insert(model);
         }
       }
-      // DBへの保存が完了したら、DBから再度読み込んで画面を更新
       await _loadDataFromDb();
-      
     } catch (err) {
       debugPrint("Error syncing data: $err");
     }
   }
 
-  // ★★★ データベースからデータを読み込んで画面表示用のデータに加工する処理 ★★★
   Future<void> _loadDataFromDb({bool showLoading = false}) async {
     if (showLoading) { setState(() { _isLoading = true; }); }
     
@@ -115,21 +111,41 @@ class _UsageLogScreenState extends State<UsageLogScreen> {
     
     List<UsageEventModel> eventsFromDb = await dbHelper.queryAllEvents(startDate, endDate);
 
-    // --- ここから下のデータ加工ロジックは、DBから読み込んだデータを使う以外は前回とほぼ同じ ---
-    List<UsageEventModel> foregroundEvents = eventsFromDb.where((event) {
-      return event.eventType == '1';
-    }).toList();
+        // --- ★★★ ここからが新しいフィルタリングロジック ★★★ ---
 
+    // 1. 表示したいイベントタイプだけを許可するリスト
+    const allowedEventTypes = {
+      '1', // アプリ利用 (ACTIVITY_RESUMED)
+      '15', // 画面オン (SCREEN_INTERACTIVE)
+      '16', // 画面オフ (SCREEN_NON_INTERACTIVE)
+    };
+
+    // 2. 表示したくないシステムアプリのリスト
     const List<String> blockList = [
-      'android', 'com.android.systemui',
+      'com.android.systemui',
       'com.sec.android.app.launcher', 'com.mi.android.globallauncher',
       'com.google.android.inputmethod.latin', 'com.android.vending',
       'com.google.android.deskclock', 'com.google.android.apps.messaging',
     ];
-    List<UsageEventModel> filteredEvents = foregroundEvents.where((event) {
-      if (event.packageName == 'com.example.flutter_application_1') return true;
-      return !blockList.any((item) => event.packageName.startsWith(item));
+
+    // 3. 上記のルールに基づいてイベントをフィルタリング
+    List<UsageEventModel> filteredEvents = eventsFromDb.where((event) {
+      // 許可リストにないイベントは、まず除外
+      if (!allowedEventTypes.contains(event.eventType)) {
+        return false;
+      }
+      
+      // アプリ利用イベント(type 1)の場合のみ、blockListを適用
+      if (event.eventType == '1') {
+        // blockListに含まれるアプリも表示しない
+        if (blockList.any((item) => event.packageName.startsWith(item))) return false;
+      }
+      
+      // 上記の条件をすべてクリアしたものだけが残る
+      return true;
     }).toList();
+    
+    // --- ★★★ フィルタリングロジックここまで ★★★ ---
 
     List<UsageEventModel> sessionStartEvents = [];
     if (filteredEvents.isNotEmpty) {
@@ -155,7 +171,7 @@ class _UsageLogScreenState extends State<UsageLogScreen> {
 
       final timestamp = DateTime.fromMillisecondsSinceEpoch(currentSession.timestamp);
       final dateKey = DateFormat('yyyy年MM月dd日').format(timestamp);
-      final appInfo = _getAppIconInfo(currentSession.packageName);
+      final appInfo = _getAppIconInfo(currentSession.packageName, currentSession.eventType);
 
       final event = UsageEvent(
         title: appInfo['name'], icon: appInfo['icon'], iconColor: appInfo['color'],
@@ -169,6 +185,13 @@ class _UsageLogScreenState extends State<UsageLogScreen> {
     tempGroupedEvents.forEach((key, value) {
       tempGroupedEvents[key] = value.reversed.toList();
     });
+    
+    if (_expandedDateKeys.isEmpty || showLoading) {
+      final todayKey = DateFormat('yyyy年MM月dd日').format(DateTime.now());
+      _expandedDateKeys = {
+        if (tempGroupedEvents.containsKey(todayKey)) todayKey,
+      };
+    }
 
     setState(() {
       _groupedEvents = tempGroupedEvents;
@@ -177,16 +200,39 @@ class _UsageLogScreenState extends State<UsageLogScreen> {
   }
 
 
-  Map<String, dynamic> _getAppIconInfo(String packageName) {
-    if (packageName.contains('instagram')) { return {'name': 'Instagram', 'icon': Icons.camera_alt, 'color': Colors.pink}; }
-    if (packageName.contains('youtube')) { return {'name': 'YouTube', 'icon': Icons.play_arrow, 'color': Colors.red}; }
-    if (packageName.contains('chrome')) { return {'name': 'Chrome', 'icon': Icons.web, 'color': Colors.green}; }
-    if (packageName.contains('twitter') || packageName.contains('x.android')) { return {'name': 'X (Twitter)', 'icon': Icons.close, 'color': Colors.white}; }
-    if (packageName.contains('camera')) { return {'name': 'カメラ', 'icon': Icons.camera, 'color': Colors.lightBlue}; }
-    if (packageName.contains('com.example.flutter_application_1')) { return {'name': '開発中のアプリ', 'icon': Icons.adb, 'color': Colors.cyan}; }
-    if (packageName.contains('nexuslauncher')) { return {'name': 'ホーム', 'icon': Icons.home, 'color': const Color.fromARGB(255, 21, 197, 50)}; }
-    
-    return {'name': packageName, 'icon': Icons.app_blocking, 'color': Colors.grey};
+  // Map<String, dynamic> _getAppIconInfo(String packageName) {
+  //   if (packageName.contains('instagram')) { return {'name': 'Instagram', 'icon': Icons.camera_alt, 'color': Colors.pink}; }
+  //   if (packageName.contains('youtube')) { return {'name': 'YouTube', 'icon': Icons.play_arrow, 'color': Colors.red}; }
+  //   if (packageName.contains('chrome')) { return {'name': 'Chrome', 'icon': Icons.web, 'color': Colors.green}; }
+  //   if (packageName.contains('twitter') || packageName.contains('x.android')) { return {'name': 'X (Twitter)', 'icon': Icons.close, 'color': Colors.white}; }
+  //   if (packageName.contains('camera')) { return {'name': 'カメラ', 'icon': Icons.camera, 'color': Colors.lightBlue}; }
+  //   if (packageName.contains('com.example.flutter_application_1')) { return {'name': '開発中のアプリ', 'icon': Icons.adb, 'color': Colors.cyan}; }
+  //   // --- ★★★ 修正点②: nexuslauncherを「ホーム」として表示する処理を追加 ★★★ ---
+  //   if (packageName.contains('nexuslauncher')) { return {'name': 'ホーム', 'icon': Icons.home, 'color': Colors.greenAccent}; }
+  //   return {'name': packageName, 'icon': Icons.app_blocking, 'color': Colors.grey};
+  // }
+
+  Map<String, dynamic> _getAppIconInfo(String packageName, String eventType) {
+    switch (eventType) {
+      // --- ★★★ ここを修正しました ★★★ ---
+      case '15': // 画面オン
+        return {'name': '画面オン', 'icon': Icons.lightbulb_outline, 'color': Colors.yellowAccent};
+      case '16': // 画面オフ
+        return {'name': '画面オフ', 'icon': Icons.phone_android, 'color': Colors.grey};
+      // --- ★★★ 修正ここまで ★★★ ---
+        
+      case '1': // ACTIVITY_RESUMED (アプリ利用)
+        if (packageName.contains('instagram')) { return {'name': 'Instagram', 'icon': Icons.camera_alt, 'color': Colors.pink}; }
+        if (packageName.contains('youtube')) { return {'name': 'YouTube', 'icon': Icons.play_arrow, 'color': Colors.red}; }
+        if (packageName.contains('chrome')) { return {'name': 'Chrome', 'icon': Icons.web, 'color': Colors.green}; }
+        if (packageName.contains('twitter') || packageName.contains('x.android')) { return {'name': 'X (Twitter)', 'icon': Icons.close, 'color': Colors.white}; }
+        if (packageName.contains('camera')) { return {'name': 'カメラ', 'icon': Icons.camera, 'color': Colors.lightBlue}; }
+        if (packageName.contains('com.example.flutter_application_1')) { return {'name': '開発中のアプリ', 'icon': Icons.adb, 'color': Colors.cyan}; }
+        if (packageName.contains('nexuslauncher')) { return {'name': 'ホーム', 'icon': Icons.home, 'color': Colors.greenAccent}; }
+        return {'name': packageName, 'icon': Icons.app_blocking, 'color': Colors.grey};
+      default:
+        return {'name': '不明なイベント ($eventType)', 'icon': Icons.help_outline, 'color': Colors.grey};
+    }
   }
   
   @override
@@ -209,44 +255,66 @@ class _UsageLogScreenState extends State<UsageLogScreen> {
                   itemBuilder: (context, index) {
                     final dateKey = dateKeys[index];
                     final eventsForDay = _groupedEvents[dateKey]!;
+                    final isExpanded = _expandedDateKeys.contains(dateKey);
                     
                     return Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        Padding(
-                          padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
-                          child: Text(
-                            dateKey,
-                            style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Colors.white),
+                        InkWell(
+                          onTap: () {
+                            setState(() {
+                              if (isExpanded) {
+                                _expandedDateKeys.remove(dateKey);
+                              } else {
+                                _expandedDateKeys.add(dateKey);
+                              }
+                            });
+                          },
+                          child: Padding(
+                            padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
+                            child: Row(
+                              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                              children: [
+                                Text(
+                                  dateKey,
+                                  style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Colors.white),
+                                ),
+                                Icon(
+                                  isExpanded ? Icons.expand_less : Icons.expand_more,
+                                  color: Colors.white,
+                                ),
+                              ],
+                            ),
                           ),
                         ),
-                        ListView.builder(
-                          shrinkWrap: true,
-                          physics: const NeverScrollableScrollPhysics(),
-                          itemCount: eventsForDay.length,
-                          itemBuilder: (context, eventIndex) {
-                            final event = eventsForDay[eventIndex];
-                            return TimelineTile(
-                              alignment: TimelineAlign.manual,
-                              lineXY: 0.2,
-                              isFirst: eventIndex == 0,
-                              isLast: eventIndex == eventsForDay.length - 1,
-                              beforeLineStyle: const LineStyle(color: Colors.white54, thickness: 2),
-                              afterLineStyle: const LineStyle(color: Colors.white54, thickness: 2),
-                              indicatorStyle: IndicatorStyle(
-                                width: 15, color: Colors.white54, padding: const EdgeInsets.all(4),),
-                              startChild: Text( DateFormat('HH:mm').format(event.timestamp), textAlign: TextAlign.center,
-                                style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 12),),
-                              endChild: _buildEventDetails(event),
-                            );
-                          },
-                        ),
+                        if (isExpanded)
+                          ListView.builder(
+                            shrinkWrap: true,
+                            physics: const NeverScrollableScrollPhysics(),
+                            itemCount: eventsForDay.length,
+                            itemBuilder: (context, eventIndex) {
+                              final event = eventsForDay[eventIndex];
+                              return TimelineTile(
+                                alignment: TimelineAlign.manual,
+                                lineXY: 0.2,
+                                isFirst: eventIndex == 0,
+                                isLast: eventIndex == eventsForDay.length - 1,
+                                beforeLineStyle: const LineStyle(color: Colors.white54, thickness: 2),
+                                afterLineStyle: const LineStyle(color: Colors.white54, thickness: 2),
+                                indicatorStyle: IndicatorStyle(
+                                  width: 15, color: Colors.white54, padding: const EdgeInsets.all(4),),
+                                startChild: Text( DateFormat('HH:mm').format(event.timestamp), textAlign: TextAlign.center,
+                                  style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 12),),
+                                endChild: _buildEventDetails(event),
+                              );
+                            },
+                          ),
                       ],
                     );
                   },
                 ),
       floatingActionButton: FloatingActionButton(
-        onPressed: () => _loadDataFromDb(showLoading: true), // ボタンはDBから読み込むだけ
+        onPressed: () => _loadDataFromDb(showLoading: true),
         child: const Icon(Icons.refresh),
       ),
     );

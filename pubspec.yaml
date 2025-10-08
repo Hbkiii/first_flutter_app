@@ -51,6 +51,17 @@ dev_dependencies:
   # rules and activating additional ones.
   flutter_lints: ^6.0.0
 
+
+  flutter_launcher_icons: "^0.13.1" # <--- この行を追加
+
+# アプリのアイコン設定 (ファイルの最下部に追加)
+flutter_launcher_icons:
+  android: "launcher_icon" # Androidのアイコン名 (デフォルトでOK)
+  ios: true               # iOSのアイコンも生成する場合は true
+  image_path: "assets/images/icon_1.png" # <--- ここにアイコンのパスを指定
+  min_sdk_android: 21     # アイコンを生成するAndroidの最小SDKバージョン
+
+
 # For information on the generic Dart part of this file, see the
 # following page: https://dart.dev/tools/pub/pubspec
 
